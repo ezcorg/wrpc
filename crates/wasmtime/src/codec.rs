@@ -11,7 +11,7 @@ use futures::stream::FuturesUnordered;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::codec::{Encoder, FramedRead};
 use tokio_util::compat::FuturesAsyncReadCompatExt as _;
-use tracing::{error, instrument, trace, warn};
+use tracing::{instrument, trace, warn};
 use uuid::Uuid;
 use wasm_tokio::cm::AsyncReadValue as _;
 use wasm_tokio::{
@@ -527,18 +527,13 @@ where
                         .encode(id.to_bytes_le().as_slice(), dst)
                         .context("failed to encode resource handle")?;
                     trace!(?id, "store shared resource");
-                    if self
-                        .store
+                    self.store
                         .data_mut()
                         .wrpc()
                         .ctx
                         .shared_resources()
-                        .0
-                        .insert(id, *resource)
-                        .is_some()
-                    {
-                        error!(?id, "duplicate resource ID generated");
-                    }
+                        .try_insert(id, *resource)
+                        .context("failed to store shared resource")?;
                     Ok(())
                 } else {
                     bail!("encoding host resources not supported yet")

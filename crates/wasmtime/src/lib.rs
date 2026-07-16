@@ -81,9 +81,33 @@ fn rpc_result_type<T: Borrow<Type>>(
 
 pub struct RemoteResource(pub Bytes);
 
-/// A table of shared resources exported by the component
+/// A table of shared resources exported by the component. The second field is a
+/// capacity cap: once reached, [`SharedResourceTable::try_insert`] refuses new
+/// resources (0 = unbounded). It's a backstop against unbounded growth when a client
+/// keeps acquiring handles without dropping them — exhaustion then surfaces to the
+/// caller as an error rather than growing memory without limit.
 #[derive(Debug, Default)]
-pub struct SharedResourceTable(HashMap<Uuid, ResourceAny>);
+pub struct SharedResourceTable(HashMap<Uuid, ResourceAny>, usize);
+
+impl SharedResourceTable {
+    /// A table that refuses more than `capacity` live resources (0 = unbounded).
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self(HashMap::new(), capacity)
+    }
+
+    /// Insert an exported resource, returning `Err` once at capacity so the invocation
+    /// fails cleanly instead of the host growing memory without bound.
+    pub fn try_insert(&mut self, id: Uuid, resource: ResourceAny) -> std::io::Result<()> {
+        if self.1 != 0 && self.0.len() >= self.1 && !self.0.contains_key(&id) {
+            return Err(std::io::Error::other(format!(
+                "shared resource table at capacity ({} live handles)",
+                self.1
+            )));
+        }
+        self.0.insert(id, resource);
+        Ok(())
+    }
+}
 
 pub trait WrpcCtx<T: Invoke>: Send {
     /// Returns context to use for invocation
