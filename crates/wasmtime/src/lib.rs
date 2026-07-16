@@ -107,6 +107,25 @@ impl SharedResourceTable {
         self.0.insert(id, resource);
         Ok(())
     }
+
+    /// Remove and return the exported resource for `id`, if present. The caller is
+    /// responsible for dropping the returned [`ResourceAny`] via
+    /// `ResourceAny::resource_drop[_async]` (which runs the guest destructor) — this
+    /// only evicts the table entry. Enables a client to relay a resource-drop so a
+    /// handle it is done with is released instead of leaking for the connection's life.
+    pub fn remove(&mut self, id: &Uuid) -> Option<ResourceAny> {
+        self.0.remove(id)
+    }
+
+    /// The number of live exported-resource handles in the table.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the table holds no live handles.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 pub trait WrpcCtx<T: Invoke>: Send {
