@@ -351,6 +351,8 @@ pin_project! {
         path: Arc<[usize]>,
         index: Arc<std::sync::Mutex<IndexTrie>>,
         io: Arc<JoinSet<()>>,
+        // Bytes `Incoming::peek` pulled ahead of the reader; served first.
+        pending: Vec<u8>,
     }
 }
 
@@ -390,7 +392,29 @@ impl Incoming {
             path: Arc::from([]),
             index: Arc::clone(&index),
             io: Arc::new(rx_io),
+            pending: Vec::new(),
         }
+    }
+
+    /// The first `n` bytes of the stream, without consuming them: a later read
+    /// sees them again. Lets a server look at a leading argument (a resource
+    /// handle, a name) to decide where to dispatch before anything decodes.
+    /// Fails with `UnexpectedEof` if the stream ends first.
+    pub async fn peek(&mut self, n: usize) -> std::io::Result<Bytes> {
+        use tokio::io::AsyncReadExt as _;
+        while self.pending.len() < n {
+            let Some(rx) = self.rx.as_mut() else {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            };
+            let mut chunk = [0u8; 256];
+            let want = (n - self.pending.len()).min(chunk.len());
+            let got = rx.read(&mut chunk[..want]).await?;
+            if got == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            self.pending.extend_from_slice(&chunk[..got]);
+        }
+        Ok(Bytes::copy_from_slice(&self.pending[..n]))
     }
 
     /// Index the incoming stream using a structural `path`, returning a handle to the
@@ -422,6 +446,7 @@ impl Incoming {
             path,
             index: Arc::clone(&self.index),
             io: Arc::clone(&self.io),
+            pending: Vec::new(),
         })
     }
 }
@@ -438,6 +463,12 @@ impl AsyncRead for Incoming {
         }
         trace!("reading");
         let this = self.as_mut().project();
+        if !this.pending.is_empty() {
+            let n = this.pending.len().min(buf.remaining());
+            buf.put_slice(&this.pending[..n]);
+            this.pending.drain(..n);
+            return Poll::Ready(Ok(()));
+        }
         let Some(rx) = this.rx.as_pin_mut() else {
             trace!("reader is closed");
             return Poll::Ready(Ok(()));

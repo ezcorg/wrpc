@@ -5,7 +5,7 @@ use core::borrow::Borrow;
 use core::fmt;
 use core::future::Future;
 use core::iter::zip;
-use core::pin::{Pin, pin};
+use core::pin::pin;
 use core::time::Duration;
 
 use std::collections::{BTreeMap, HashMap};
@@ -98,6 +98,8 @@ pub struct SharedResourceTable {
     entries: HashMap<Uuid, (ResourceAny, Option<u64>)>,
     capacity: usize,
     scope: Option<u64>,
+    /// Handles inserted since the last [`Self::take_minted`].
+    minted: Vec<Uuid>,
 }
 
 impl SharedResourceTable {
@@ -107,6 +109,7 @@ impl SharedResourceTable {
             entries: HashMap::new(),
             capacity,
             scope: None,
+            minted: Vec::new(),
         }
     }
 
@@ -136,7 +139,14 @@ impl SharedResourceTable {
             )));
         }
         self.entries.insert(id, (resource, self.scope));
+        self.minted.push(id);
         Ok(())
+    }
+
+    /// The handles minted since the last call: what a server fronting several
+    /// tables records so it can find a handle's table again.
+    pub fn take_minted(&mut self) -> Vec<Uuid> {
+        core::mem::take(&mut self.minted)
     }
 
     /// The exported resource for `id`, if it is live **and** was minted in the
@@ -442,9 +452,9 @@ impl fmt::Display for CallError {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn call<C>(
-    store: C,
+    mut store: C,
     rx: Incoming,
-    tx: Outgoing,
+    mut tx: Outgoing,
     guest_resources: &[ResourceType],
     host_resources: &HashMap<Box<str>, HashMap<Box<str>, (ResourceType, ResourceType)>>,
     io_streams: &[ResourceType],
@@ -455,54 +465,6 @@ pub async fn call<C>(
 where
     C: AsContextMut,
     C::Data: WrpcView,
-{
-    call_with(
-        store,
-        rx,
-        tx,
-        guest_resources,
-        host_resources,
-        io_streams,
-        params_ty,
-        results_ty,
-        move |_, _| Box::pin(core::future::ready(Ok(Chosen { func }))),
-    )
-    .await
-}
-
-/// The function a [`call_with`] chooser settled on, once the parameters are
-/// decoded.
-pub struct Chosen {
-    pub func: Func,
-}
-
-/// A [`call`] whose function is chosen **after** the parameters are decoded, by
-/// `choose`, which sees the decoded values and the store. This is how one served
-/// export name can front several instances in the same store: a method call is
-/// routed to the instance that owns its resource, a freestanding call to whichever
-/// instance its arguments select. `guest_resources` are the resource types a
-/// parameter or result may be declared as, across every instance the name fronts;
-/// the codec checks declared types against it (the instance's *live* types are
-/// what a decoded `ResourceAny` reports, and are the chooser's to route on).
-#[allow(clippy::too_many_arguments)]
-pub async fn call_with<C, F>(
-    mut store: C,
-    rx: Incoming,
-    mut tx: Outgoing,
-    guest_resources: &[ResourceType],
-    host_resources: &HashMap<Box<str>, HashMap<Box<str>, (ResourceType, ResourceType)>>,
-    io_streams: &[ResourceType],
-    params_ty: impl ExactSizeIterator<Item = &Type>,
-    results_ty: &[Type],
-    choose: F,
-) -> Result<(), CallError>
-where
-    C: AsContextMut,
-    C::Data: WrpcView,
-    F: for<'a> FnOnce(
-        &'a mut C,
-        &'a [Val],
-    ) -> Pin<Box<dyn Future<Output = wasmtime::Result<Chosen>> + Send + 'a>>,
 {
     let mut params = vec![Val::Bool(false); params_ty.len()];
     let mut rx = pin!(rx);
@@ -520,9 +482,6 @@ where
         .with_context(|| format!("failed to decode parameter value {i}"))
         .map_err(CallError::Decode)?;
     }
-    let Chosen { func } = choose(&mut store, &params)
-        .await
-        .map_err(|e| CallError::Call(e.context("failed to choose the function to call")))?;
     let mut results = vec![Val::Bool(false); results_ty.len()];
     func.call_async(&mut store, &params, &mut results)
         .await
