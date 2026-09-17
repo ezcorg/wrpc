@@ -452,6 +452,40 @@ impl fmt::Display for CallError {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn call<C>(
+    store: C,
+    rx: Incoming,
+    tx: Outgoing,
+    guest_resources: &[ResourceType],
+    host_resources: &HashMap<Box<str>, HashMap<Box<str>, (ResourceType, ResourceType)>>,
+    io_streams: &[ResourceType],
+    params_ty: impl ExactSizeIterator<Item = &Type>,
+    results_ty: &[Type],
+    func: Func,
+) -> Result<(), CallError>
+where
+    C: AsContextMut,
+    C::Data: WrpcView,
+{
+    call_observed(
+        store,
+        rx,
+        tx,
+        guest_resources,
+        host_resources,
+        io_streams,
+        params_ty,
+        results_ty,
+        func,
+        |_| Ok(()),
+    )
+    .await
+}
+
+/// [`call`] with a look at the decoded parameters before the function runs:
+/// `observe` may refuse the call (its error is reported as the call's), which
+/// is how a server admits a call against the values it carries.
+#[allow(clippy::too_many_arguments)]
+pub async fn call_observed<C>(
     mut store: C,
     rx: Incoming,
     mut tx: Outgoing,
@@ -461,6 +495,7 @@ pub async fn call<C>(
     params_ty: impl ExactSizeIterator<Item = &Type>,
     results_ty: &[Type],
     func: Func,
+    observe: impl FnOnce(&[Val]) -> wasmtime::Result<()>,
 ) -> Result<(), CallError>
 where
     C: AsContextMut,
@@ -482,6 +517,7 @@ where
         .with_context(|| format!("failed to decode parameter value {i}"))
         .map_err(CallError::Decode)?;
     }
+    observe(&params).map_err(CallError::Call)?;
     let mut results = vec![Val::Bool(false); results_ty.len()];
     func.call_async(&mut store, &params, &mut results)
         .await
