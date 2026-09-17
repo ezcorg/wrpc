@@ -5,12 +5,12 @@ use core::pin::{Pin, pin};
 
 use std::collections::HashSet;
 
-use bytes::{BufMut as _, BytesMut};
+use crate::access::StoreAccess;
+use bytes::{BufMut as _, Bytes, BytesMut};
 use futures::TryStreamExt as _;
 use futures::stream::FuturesUnordered;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::codec::{Encoder, FramedRead};
-use tokio_util::compat::FuturesAsyncReadCompatExt as _;
 use tracing::{instrument, trace, warn};
 use uuid::Uuid;
 use wasm_tokio::cm::AsyncReadValue as _;
@@ -22,7 +22,6 @@ use wasmtime::bail;
 use wasmtime::component::types::{Case, Field};
 use wasmtime::component::{ResourceType, Type, Val};
 use wasmtime::error::Context as _;
-use wasmtime::{AsContextMut, StoreContextMut};
 use wasmtime_wasi::p2::pipe::AsyncReadStream;
 use wasmtime_wasi::p2::{DynInputStream, StreamError};
 use wrpc_transport::ListDecoderU8;
@@ -30,8 +29,11 @@ use wrpc_transport::frame::{Incoming, Outgoing};
 
 use crate::{RemoteResource, WrpcView};
 
-pub struct ValEncoder<'a, T: 'static> {
-    pub store: StoreContextMut<'a, T>,
+pub struct ValEncoder<'a, T: 'static, A: StoreAccess<T>> {
+    pub store: &'a mut A,
+    pub _data: core::marker::PhantomData<T>,
+    /// The connection scope shared resource handles are minted in.
+    pub scope: Option<u64>,
     pub ty: &'a Type,
     pub resources: &'a [ResourceType],
     /// Resource types bridged to wRPC `stream<u8>` (`wasi:io` `input-stream`/
@@ -45,16 +47,19 @@ pub struct ValEncoder<'a, T: 'static> {
     >,
 }
 
-impl<T> ValEncoder<'_, T> {
+impl<T: 'static, A: StoreAccess<T>> ValEncoder<'_, T, A> {
     #[must_use]
     pub fn new<'a>(
-        store: StoreContextMut<'a, T>,
+        store: &'a mut A,
+        scope: Option<u64>,
         ty: &'a Type,
         resources: &'a [ResourceType],
         io_streams: &'a [ResourceType],
-    ) -> ValEncoder<'a, T> {
+    ) -> ValEncoder<'a, T, A> {
         ValEncoder {
             store,
+            _data: core::marker::PhantomData,
+            scope,
             ty,
             resources,
             io_streams,
@@ -62,9 +67,11 @@ impl<T> ValEncoder<'_, T> {
         }
     }
 
-    pub fn with_type<'a>(&'a mut self, ty: &'a Type) -> ValEncoder<'a, T> {
+    pub fn with_type<'a>(&'a mut self, ty: &'a Type) -> ValEncoder<'a, T, A> {
         ValEncoder {
-            store: self.store.as_context_mut(),
+            store: &mut *self.store,
+            _data: core::marker::PhantomData,
+            scope: self.scope,
             ty,
             resources: self.resources,
             io_streams: self.io_streams,
@@ -131,9 +138,10 @@ where
     Ok(())
 }
 
-impl<T> Encoder<&Val> for ValEncoder<'_, T>
+impl<T, A> Encoder<&Val> for ValEncoder<'_, T, A>
 where
-    T: WrpcView,
+    T: WrpcView + 'static,
+    A: StoreAccess<T>,
 {
     type Error = wasmtime::Error;
 
@@ -454,94 +462,133 @@ where
             }
             (Val::Resource(resource), Type::Own(ty) | Type::Borrow(ty)) => {
                 if *ty == ResourceType::host::<DynInputStream>() || self.io_streams.contains(ty) {
-                    let stream = resource
-                        .try_into_resource::<DynInputStream>(&mut self.store)
-                        .context("failed to downcast `wasi:io/input-stream`")?;
-                    if stream.owned() {
-                        let mut stream = self
-                            .store
+                    let stream = self.store.with(|mut store| -> wasmtime::Result<_> {
+                        let stream = resource
+                            .try_into_resource::<DynInputStream>(&mut store)
+                            .context("failed to downcast `wasi:io/input-stream`")?;
+                        if !stream.owned() {
+                            // NOTE: In order to handle this we'd need to know how many bytes the
+                            // receiver has read. That means that some kind of callback would be
+                            // required from the receiver. This is not trivial and generally should
+                            // be a very rare use case.
+                            bail!("encoding borrowed `wasi:io/input-stream` not supported yet");
+                        }
+                        store
                             .data_mut()
                             .wrpc()
                             .table
                             .delete(stream)
-                            .context("failed to delete input stream")?;
-                        self.deferred = Some(Box::new(|w| {
-                            Box::pin(async move {
-                                let mut w = pin!(w);
-                                loop {
-                                    stream.ready().await;
-                                    match stream.read(8096) {
-                                        Ok(buf) => {
-                                            let mut chunk = BytesMut::with_capacity(
-                                                buf.len().saturating_add(5),
-                                            );
-                                            CoreVecEncoderBytes
-                                                .encode(buf, &mut chunk)
-                                                .context("failed to encode input stream chunk")?;
-                                            w.write_all(&chunk).await?;
-                                        }
-                                        Err(StreamError::Closed) => {
-                                            w.write_all(&[0x00]).await?;
-                                        }
-                                        Err(err) => return Err(err.into()),
+                            .context("failed to delete input stream")
+                    })?;
+                    let mut stream = stream;
+                    // Pending: an empty inline chunk; the bytes follow on the
+                    // indexed sub-stream, chunked and ended by an empty chunk.
+                    dst.reserve(1);
+                    dst.put_u8(0x00);
+                    self.deferred = Some(Box::new(|w| {
+                        Box::pin(async move {
+                            let mut w = pin!(w);
+                            loop {
+                                stream.ready().await;
+                                match stream.read(8096) {
+                                    Ok(buf) => {
+                                        let mut chunk =
+                                            BytesMut::with_capacity(buf.len().saturating_add(5));
+                                        CoreVecEncoderBytes
+                                            .encode(buf, &mut chunk)
+                                            .context("failed to encode input stream chunk")?;
+                                        w.write_all(&chunk).await?;
                                     }
+                                    Err(StreamError::Closed) => {
+                                        w.write_all(&[0x00]).await?;
+                                    }
+                                    Err(err) => return Err(err.into()),
                                 }
-                            })
-                        }));
-                    } else {
-                        self.store
-                            .data_mut()
-                            .wrpc()
-                            .table
-                            .get_mut(&stream)
-                            .context("failed to get input stream")?;
-                        // NOTE: In order to handle this we'd need to know how many bytes the
-                        // receiver has read. That means that some kind of callback would be required from
-                        // the receiver. This is not trivial and generally should be a very rare use case.
-                        bail!("encoding borrowed `wasi:io/input-stream` not supported yet");
-                    }
+                            }
+                        })
+                    }));
                     Ok(())
                 } else if resource.ty() == ResourceType::host::<RemoteResource>() {
-                    let resource = resource
-                        .try_into_resource(&mut self.store)
-                        .context("resource type mismatch")?;
-                    let table = self.store.data_mut().wrpc().table;
-                    if resource.owned() {
-                        let RemoteResource(buf) = table
-                            .delete(resource)
-                            .context("failed to delete remote resource")?;
-                        CoreVecEncoderBytes
-                            .encode(buf, dst)
-                            .context("failed to encode resource handle")
-                    } else {
-                        let RemoteResource(buf) = table
-                            .get(&resource)
-                            .context("failed to get remote resource")?;
-                        CoreVecEncoderBytes
-                            .encode(buf, dst)
-                            .context("failed to encode resource handle")
-                    }
+                    let buf = self.store.with(|mut store| -> wasmtime::Result<Bytes> {
+                        let resource = resource
+                            .try_into_resource(&mut store)
+                            .context("resource type mismatch")?;
+                        let table = store.data_mut().wrpc().table;
+                        if resource.owned() {
+                            let RemoteResource(buf) = table
+                                .delete(resource)
+                                .context("failed to delete remote resource")?;
+                            Ok(buf)
+                        } else {
+                            let RemoteResource(buf) = table
+                                .get(&resource)
+                                .context("failed to get remote resource")?;
+                            Ok(buf.clone())
+                        }
+                    })?;
+                    CoreVecEncoderBytes
+                        .encode(buf, dst)
+                        .context("failed to encode resource handle")
                 } else if self.resources.contains(ty) {
                     let id = Uuid::now_v7();
                     CoreVecEncoderBytes
                         .encode(id.to_bytes_le().as_slice(), dst)
                         .context("failed to encode resource handle")?;
                     trace!(?id, "store shared resource");
-                    self.store
-                        .data_mut()
-                        .wrpc()
-                        .ctx
-                        .shared_resources()
-                        .try_insert(id, *resource)
-                        .context("failed to store shared resource")?;
+                    let scope = self.scope;
+                    self.store.with(|mut store| {
+                        store
+                            .data_mut()
+                            .wrpc()
+                            .ctx
+                            .shared_resources()
+                            .try_insert(scope, id, *resource)
+                            .context("failed to store shared resource")
+                    })?;
                     Ok(())
                 } else {
                     bail!("encoding host resources not supported yet")
                 }
             }
 
-            (_, Type::Future(..) | Type::Stream(..) | Type::ErrorContext) => {
-                bail!("async not supported")
+            // A component-model `stream<u8>`: the guest's stream is drained into
+            // a channel and written after the value, as wRPC carries it.
+            (Val::Stream(stream), Type::Stream(ty)) => {
+                if ty.ty() != Some(Type::U8) {
+                    bail!("only `stream<u8>` is supported");
+                }
+                let stream = stream.clone();
+                let (mut bytes, _done) = self.store.with(|mut store| -> wasmtime::Result<_> {
+                    let reader = stream
+                        .try_into_stream_reader::<u8>()
+                        .context("stream payload type mismatch")?;
+                    crate::stream::drain(&mut store, reader)
+                })?;
+                // Pending: an empty inline chunk; the bytes follow on the
+                // indexed sub-stream, chunked and ended by an empty chunk.
+                dst.reserve(1);
+                dst.put_u8(0x00);
+                self.deferred = Some(Box::new(|w| {
+                    Box::pin(async move {
+                        use futures::StreamExt as _;
+                        let mut w = pin!(w);
+                        while let Some(buf) = bytes.next().await {
+                            let mut chunk = BytesMut::with_capacity(buf.len().saturating_add(5));
+                            CoreVecEncoderBytes
+                                .encode(buf, &mut chunk)
+                                .context("failed to encode stream chunk")?;
+                            w.write_all(&chunk).await?;
+                        }
+                        w.write_all(&[0x00]).await?;
+                        w.flush().await?;
+                        Ok(())
+                    })
+                }));
+                Ok(())
+            }
+
+            (_, Type::Future(..) | Type::ErrorContext) => {
+                bail!("futures and error contexts are not supported")
             }
             (_, Type::Map(..)) => {
                 bail!("maps not supported")
@@ -564,8 +611,9 @@ async fn read_flags(n: usize, r: &mut (impl AsyncRead + Unpin)) -> std::io::Resu
 /// Read encoded value of type [`Type`] from an [`AsyncRead`] into a [`Val`]
 #[instrument(level = "trace", skip_all, fields(ty, path))]
 #[allow(clippy::too_many_arguments)]
-pub async fn read_value<T>(
-    store: &mut impl AsContextMut<Data = T>,
+pub async fn read_value<T, A>(
+    store: &mut A,
+    scope: Option<u64>,
     r: &mut Pin<&mut Incoming>,
     resources: &[ResourceType],
     io_streams: &[ResourceType],
@@ -575,7 +623,9 @@ pub async fn read_value<T>(
 ) -> std::io::Result<()>
 where
     T: WrpcView + 'static,
+    A: StoreAccess<T>,
 {
+    let owned = matches!(ty, Type::Own(_));
     match ty {
         Type::Bool => {
             let v = r.read_bool().await?;
@@ -654,7 +704,7 @@ where
                 path.push(i);
                 trace!(i, "reading list element value");
                 Box::pin(read_value(
-                    store, r, resources, io_streams, &mut v, &ty, &path,
+                    store, scope, r, resources, io_streams, &mut v, &ty, &path,
                 ))
                 .await?;
                 path.pop();
@@ -672,7 +722,7 @@ where
                 path.push(i);
                 trace!(i, "reading struct field value");
                 Box::pin(read_value(
-                    store, r, resources, io_streams, &mut v, &ty, &path,
+                    store, scope, r, resources, io_streams, &mut v, &ty, &path,
                 ))
                 .await?;
                 path.pop();
@@ -690,7 +740,7 @@ where
                 path.push(i);
                 trace!(i, "reading tuple element value");
                 Box::pin(read_value(
-                    store, r, resources, io_streams, &mut v, &ty, &path,
+                    store, scope, r, resources, io_streams, &mut v, &ty, &path,
                 ))
                 .await?;
                 path.pop();
@@ -715,7 +765,7 @@ where
                 let mut v = Val::Bool(false);
                 trace!(variant = name, "reading nested variant value");
                 Box::pin(read_value(
-                    store, r, resources, io_streams, &mut v, &ty, path,
+                    store, scope, r, resources, io_streams, &mut v, &ty, path,
                 ))
                 .await?;
                 *val = Val::Variant(name, Some(Box::new(v)));
@@ -745,6 +795,7 @@ where
                 trace!("reading nested `option::some` value");
                 Box::pin(read_value(
                     store,
+                    scope,
                     r,
                     resources,
                     io_streams,
@@ -766,7 +817,7 @@ where
                     let mut v = Val::Bool(false);
                     trace!("reading nested `result::ok` value");
                     Box::pin(read_value(
-                        store, r, resources, io_streams, &mut v, &ty, path,
+                        store, scope, r, resources, io_streams, &mut v, &ty, path,
                     ))
                     .await?;
                     *val = Val::Result(Ok(Some(Box::new(v))));
@@ -777,7 +828,7 @@ where
                 let mut v = Val::Bool(false);
                 trace!("reading nested `result::err` value");
                 Box::pin(read_value(
-                    store, r, resources, io_streams, &mut v, &ty, path,
+                    store, scope, r, resources, io_streams, &mut v, &ty, path,
                 ))
                 .await?;
                 *val = Val::Result(Err(Some(Box::new(v))));
@@ -839,31 +890,25 @@ where
         }
         Type::Own(ty) | Type::Borrow(ty) => {
             if *ty == ResourceType::host::<DynInputStream>() || io_streams.contains(ty) {
-                let mut store = store.as_context_mut();
-                let r = r.index(path).map_err(std::io::Error::other)?;
-                // TODO: Implement a custom reader, this approach ignores the stream end (`\0`),
-                // which will could potentially break/hang with some transports
+                let bytes = read_byte_stream(r, path).await?;
                 // The stream must be typed as `DynInputStream` (the host resource type),
                 // otherwise the resulting resource handle carries the concrete reader type
                 // and fails the guest's `own<input-stream>` type check.
-                let stream: DynInputStream = Box::new(AsyncReadStream::new(
-                    FramedRead::new(r, ListDecoderU8::default())
-                        .into_async_read()
-                        .compat(),
-                ));
-                let res = store
-                    .data_mut()
-                    .wrpc()
-                    .table
-                    .push(stream)
-                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::OutOfMemory, err))?;
-                let v = res
-                    .try_into_resource_any(store)
-                    .map_err(std::io::Error::other)?;
+                let stream: DynInputStream =
+                    Box::new(AsyncReadStream::new(tokio_util::io::StreamReader::new(
+                        futures::StreamExt::map(bytes, Ok::<_, std::io::Error>),
+                    )));
+                let v = store.with(|mut store| -> std::io::Result<_> {
+                    let res =
+                        store.data_mut().wrpc().table.push(stream).map_err(|err| {
+                            std::io::Error::new(std::io::ErrorKind::OutOfMemory, err)
+                        })?;
+                    res.try_into_resource_any(store)
+                        .map_err(std::io::Error::other)
+                })?;
                 *val = Val::Resource(v);
                 Ok(())
             } else if resources.contains(ty) {
-                let mut store = store.as_context_mut();
                 let mut id = uuid::Bytes::default();
                 debug_assert_eq!(id.len(), 16);
                 let n = r.read_u8_leb128().await?;
@@ -889,36 +934,63 @@ where
 
                 let id = Uuid::from_bytes_le(id);
                 trace!(?id, "lookup shared resource");
+                // An `own` parameter hands the resource to the callee: it
+                // leaves the table with the call. A `borrow` only looks it up.
                 let resource = store
-                    .data_mut()
-                    .wrpc()
-                    .ctx
-                    .shared_resources()
-                    .get(&id)
+                    .with(|mut store| {
+                        let shared = store.data_mut().wrpc().ctx.shared_resources();
+                        if owned {
+                            shared.remove(scope, &id)
+                        } else {
+                            shared.get(scope, &id).copied()
+                        }
+                    })
                     .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-                *val = Val::Resource(*resource);
+                *val = Val::Resource(resource);
                 Ok(())
             } else {
-                let mut store = store.as_context_mut();
                 let n = r.read_u32_leb128().await?;
                 let n = usize::try_from(n)
                     .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
                 let mut buf = Vec::with_capacity(n);
                 r.read_to_end(&mut buf).await?;
-                let table = store.data_mut().wrpc().table;
-                let resource = table
-                    .push(RemoteResource(buf.into()))
-                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::OutOfMemory, err))?;
-                let resource = resource
-                    .try_into_resource_any(store)
-                    .map_err(std::io::Error::other)?;
+                let resource = store.with(|mut store| -> std::io::Result<_> {
+                    let table = store.data_mut().wrpc().table;
+                    let resource = table
+                        .push(RemoteResource(buf.into()))
+                        .map_err(|err| std::io::Error::new(std::io::ErrorKind::OutOfMemory, err))?;
+                    resource
+                        .try_into_resource_any(store)
+                        .map_err(std::io::Error::other)
+                })?;
                 *val = Val::Resource(resource);
                 Ok(())
             }
         }
-        Type::Future(..) | Type::Stream(..) | Type::ErrorContext => Err(std::io::Error::new(
+        // A component-model `stream<u8>`: the wRPC sub-stream at this path
+        // becomes what the guest reads.
+        Type::Stream(ty) => {
+            if ty.ty() != Some(Type::U8) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "only `stream<u8>` is supported",
+                ));
+            }
+            let bytes = read_byte_stream(r, path).await?;
+            let producer = crate::stream::BytesProducer::new(bytes);
+            let v = store.with(|mut store| -> std::io::Result<_> {
+                let reader = wasmtime::component::StreamReader::<u8>::new(&mut store, producer)
+                    .map_err(std::io::Error::other)?;
+                reader
+                    .try_into_stream_any(&mut store)
+                    .map_err(std::io::Error::other)
+            })?;
+            *val = Val::Stream(v);
+            Ok(())
+        }
+        Type::Future(..) | Type::ErrorContext => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "async not supported",
+            "futures and error contexts are not supported",
         )),
         Type::Map(..) => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -929,4 +1001,27 @@ where
             "fixed-length lists not supported",
         )),
     }
+}
+
+/// A wRPC `stream<u8>` value at `path`: an inline length-prefixed chunk, which
+/// when non-empty is the whole stream, and when empty means the bytes follow
+/// on the indexed sub-stream as chunks ended by an empty one.
+async fn read_byte_stream(
+    r: &mut Pin<&mut Incoming>,
+    path: &[usize],
+) -> std::io::Result<crate::stream::BoxStream> {
+    use futures::StreamExt as _;
+    let n = r.read_u32_leb128().await?;
+    if n > 0 {
+        let n = usize::try_from(n)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+        let mut buf = vec![0; n];
+        r.read_exact(&mut buf).await?;
+        return Ok(Box::pin(futures::stream::iter([Bytes::from(buf)])));
+    }
+    let sub = r.index(path).map_err(std::io::Error::other)?;
+    let chunks = FramedRead::new(sub, ListDecoderU8::default())
+        .take_while(|item| core::future::ready(item.as_ref().is_ok_and(|c| !c.is_empty())))
+        .filter_map(|item| core::future::ready(item.ok().map(Bytes::from)));
+    Ok(Box::pin(chunks))
 }

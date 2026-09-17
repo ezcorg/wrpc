@@ -30,13 +30,16 @@ use crate::bindings::rpc::context::Context;
 use crate::bindings::rpc::error::Error;
 use crate::bindings::rpc::transport::{IncomingChannel, Invocation, OutgoingChannel};
 
+pub mod access;
 pub mod bindings;
 mod codec;
 pub mod paths;
 mod polyfill;
 pub mod rpc;
 mod serve;
+pub mod stream;
 
+pub use access::*;
 pub use codec::*;
 pub use polyfill::*;
 pub use serve::*;
@@ -88,16 +91,14 @@ pub struct RemoteResource(pub Bytes);
 /// caller as an error rather than growing memory without limit.
 ///
 /// Every handle is **bound to the scope it was minted in**: the transport
-/// connection, identified by whatever the server sets with [`Self::set_scope`]
-/// before serving an invocation. A lookup or removal from any other scope finds
-/// nothing, so a handle that leaks out of one connection is inert on every
-/// other. A server that never sets a scope mints unscoped handles, visible only
-/// to unscoped invocations.
+/// connection, as the server identifies it per operation. A lookup or removal
+/// from any other scope finds nothing, so a handle that leaks out of one
+/// connection is inert on every other. Unscoped operations (`None`) only see
+/// unscoped handles.
 #[derive(Debug, Default)]
 pub struct SharedResourceTable {
     entries: HashMap<Uuid, (ResourceAny, Option<u64>)>,
     capacity: usize,
-    scope: Option<u64>,
     /// Handles inserted since the last [`Self::take_minted`].
     minted: Vec<Uuid>,
 }
@@ -108,27 +109,19 @@ impl SharedResourceTable {
         Self {
             entries: HashMap::new(),
             capacity,
-            scope: None,
             minted: Vec::new(),
         }
     }
 
-    /// The scope (connection) the next inserts are tagged with and the next
-    /// lookups are restricted to. Set it before each invocation from that
-    /// invocation's transport context.
-    pub fn set_scope(&mut self, scope: Option<u64>) {
-        self.scope = scope;
-    }
-
-    /// The current scope.
-    pub fn scope(&self) -> Option<u64> {
-        self.scope
-    }
-
-    /// Insert an exported resource, returning `Err` once at capacity so the invocation
-    /// fails cleanly instead of the host growing memory without bound. The entry is
-    /// tagged with the current scope.
-    pub fn try_insert(&mut self, id: Uuid, resource: ResourceAny) -> std::io::Result<()> {
+    /// Insert an exported resource under `scope`, returning `Err` once at
+    /// capacity so the invocation fails cleanly instead of the host growing
+    /// memory without bound.
+    pub fn try_insert(
+        &mut self,
+        scope: Option<u64>,
+        id: Uuid,
+        resource: ResourceAny,
+    ) -> std::io::Result<()> {
         if self.capacity != 0
             && self.entries.len() >= self.capacity
             && !self.entries.contains_key(&id)
@@ -138,7 +131,7 @@ impl SharedResourceTable {
                 self.capacity
             )));
         }
-        self.entries.insert(id, (resource, self.scope));
+        self.entries.insert(id, (resource, scope));
         self.minted.push(id);
         Ok(())
     }
@@ -149,22 +142,20 @@ impl SharedResourceTable {
         core::mem::take(&mut self.minted)
     }
 
-    /// The exported resource for `id`, if it is live **and** was minted in the
-    /// current scope.
-    pub fn get(&self, id: &Uuid) -> Option<&ResourceAny> {
+    /// The exported resource for `id`, if it is live **and** was minted in `scope`.
+    pub fn get(&self, scope: Option<u64>, id: &Uuid) -> Option<&ResourceAny> {
         match self.entries.get(id) {
-            Some((resource, scope)) if *scope == self.scope => Some(resource),
+            Some((resource, owner)) if *owner == scope => Some(resource),
             _ => None,
         }
     }
 
-    /// Remove and return the exported resource for `id`, if present in the current
-    /// scope. The caller is responsible for dropping the returned [`ResourceAny`] via
+    /// Remove and return the exported resource for `id`, if present in `scope`.
+    /// The caller is responsible for dropping the returned [`ResourceAny`] via
     /// `ResourceAny::resource_drop[_async]` (which runs the guest destructor) — this
-    /// only evicts the table entry. Enables a client to relay a resource-drop so a
-    /// handle it is done with is released instead of leaking for the connection's life.
-    pub fn remove(&mut self, id: &Uuid) -> Option<ResourceAny> {
-        self.get(id)?;
+    /// only evicts the table entry.
+    pub fn remove(&mut self, scope: Option<u64>, id: &Uuid) -> Option<ResourceAny> {
+        self.get(scope, id)?;
         self.entries.remove(id).map(|(resource, _)| resource)
     }
 
@@ -488,7 +479,7 @@ where
 pub async fn call_observed<C>(
     mut store: C,
     rx: Incoming,
-    mut tx: Outgoing,
+    tx: Outgoing,
     guest_resources: &[ResourceType],
     host_resources: &HashMap<Box<str>, HashMap<Box<str>, (ResourceType, ResourceType)>>,
     io_streams: &[ResourceType],
@@ -501,11 +492,13 @@ where
     C: AsContextMut,
     C::Data: WrpcView,
 {
+    let mut access = Direct(&mut store);
     let mut params = vec![Val::Bool(false); params_ty.len()];
     let mut rx = pin!(rx);
     for (i, (v, ty)) in zip(&mut params, params_ty).enumerate() {
         read_value(
-            &mut store,
+            &mut access,
+            None,
             &mut rx,
             guest_resources,
             io_streams,
@@ -523,7 +516,102 @@ where
         .await
         .context("failed to call function")
         .map_err(CallError::Call)?;
+    let mut access = Direct(&mut store);
+    write_results(
+        &mut access,
+        None,
+        tx,
+        guest_resources,
+        host_resources,
+        io_streams,
+        results_ty,
+        results,
+        |_| {},
+    )
+    .await
+}
 
+/// Serve one invocation from inside `Store::run_concurrent`: parameters are
+/// decoded through `accessor`, `observe` sees them (and may refuse the call),
+/// the function runs as a concurrent task, and the results are encoded back,
+/// streams included. `scope` is the connection the handles belong to;
+/// `after_encode` runs once the results are encoded and before they are
+/// transmitted, so a server can record the handles they carry first.
+#[allow(clippy::too_many_arguments)]
+pub async fn call_concurrent_observed<T, D>(
+    accessor: &wasmtime::component::Accessor<T, D>,
+    scope: Option<u64>,
+    rx: Incoming,
+    tx: Outgoing,
+    guest_resources: &[ResourceType],
+    host_resources: &HashMap<Box<str>, HashMap<Box<str>, (ResourceType, ResourceType)>>,
+    io_streams: &[ResourceType],
+    params_ty: impl ExactSizeIterator<Item = &Type>,
+    results_ty: &[Type],
+    func: Func,
+    observe: impl FnOnce(&[Val]) -> wasmtime::Result<()>,
+    after_encode: impl FnOnce(&wasmtime::component::Accessor<T, D>),
+) -> Result<(), CallError>
+where
+    T: WrpcView + Send + 'static,
+    D: wasmtime::component::HasData + ?Sized,
+{
+    let mut access = ViaAccessor(accessor);
+    let mut params = vec![Val::Bool(false); params_ty.len()];
+    let mut rx = pin!(rx);
+    for (i, (v, ty)) in zip(&mut params, params_ty).enumerate() {
+        read_value(
+            &mut access,
+            scope,
+            &mut rx,
+            guest_resources,
+            io_streams,
+            v,
+            ty,
+            &[i],
+        )
+        .await
+        .with_context(|| format!("failed to decode parameter value {i}"))
+        .map_err(CallError::Decode)?;
+    }
+    observe(&params).map_err(CallError::Call)?;
+    let mut results = vec![Val::Bool(false); results_ty.len()];
+    func.call_concurrent(accessor, &params, &mut results)
+        .await
+        .context("failed to call function")
+        .map_err(CallError::Call)?;
+    write_results(
+        &mut access,
+        scope,
+        tx,
+        guest_resources,
+        host_resources,
+        io_streams,
+        results_ty,
+        results,
+        |access| after_encode(access.0),
+    )
+    .await
+}
+
+/// Encode `results` and transmit them on `tx`, then run the deferred stream
+/// writers (each on its own indexed sub-stream) to completion.
+#[allow(clippy::too_many_arguments)]
+async fn write_results<T, A>(
+    access: &mut A,
+    scope: Option<u64>,
+    mut tx: Outgoing,
+    guest_resources: &[ResourceType],
+    host_resources: &HashMap<Box<str>, HashMap<Box<str>, (ResourceType, ResourceType)>>,
+    io_streams: &[ResourceType],
+    results_ty: &[Type],
+    results: Vec<Val>,
+    after_encode: impl FnOnce(&mut A),
+) -> Result<(), CallError>
+where
+    T: WrpcView + 'static,
+    A: StoreAccess<T>,
+{
     let mut buf = BytesMut::default();
     let mut deferred = vec![];
     match (
@@ -532,8 +620,7 @@ where
     ) {
         (None, results) => {
             for (i, (v, ty)) in zip(results, results_ty).enumerate() {
-                let mut enc =
-                    ValEncoder::new(store.as_context_mut(), ty, guest_resources, io_streams);
+                let mut enc = ValEncoder::new(access, scope, ty, guest_resources, io_streams);
                 enc.encode(v, &mut buf)
                     .with_context(|| format!("failed to encode result value {i}"))
                     .map_err(CallError::Encode)?;
@@ -544,7 +631,7 @@ where
         (Some(None), [Val::Result(Ok(None))]) => {}
         // `result<T, rpc-eror>`
         (Some(Some(ty)), [Val::Result(Ok(Some(v)))]) => {
-            let mut enc = ValEncoder::new(store.as_context_mut(), ty, guest_resources, io_streams);
+            let mut enc = ValEncoder::new(access, scope, ty, guest_resources, io_streams);
             enc.encode(v, &mut buf)
                 .context("failed to encode result value 0")
                 .map_err(CallError::Encode)?;
@@ -556,15 +643,13 @@ where
                     "RPC result error value is not a resource",
                 )));
             };
-            let mut store = store.as_context_mut();
-            let err = err
-                .try_into_resource(&mut store)
-                .context("RPC result error resource type mismatch")
-                .map_err(CallError::TypeMismatch)?;
-            let err = store
-                .data_mut()
-                .delete_error(err)
-                .map_err(CallError::Table)?;
+            let err = access.with(|mut store| -> Result<Error, CallError> {
+                let err = err
+                    .try_into_resource(&mut store)
+                    .context("RPC result error resource type mismatch")
+                    .map_err(CallError::TypeMismatch)?;
+                store.data_mut().delete_error(err).map_err(CallError::Table)
+            })?;
             return Err(CallError::Guest(err));
         }
         _ => {
@@ -574,6 +659,8 @@ where
         }
     }
 
+    // Handles minted into the results exist before the caller can name them.
+    after_encode(access);
     debug!("transmitting results");
     tx.write_all(&buf)
         .await

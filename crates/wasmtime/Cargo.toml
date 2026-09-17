@@ -19,7 +19,11 @@ tokio-util = { workspace = true, features = ["codec", "compat"] }
 tracing = { workspace = true, features = ["attributes"] }
 uuid = { workspace = true, features = ["std", "v7"] }
 wasm-tokio = { workspace = true }
-wasmtime = { workspace = true, features = ["anyhow"] }
+wasmtime = { workspace = true, features = [
+    "anyhow",
+    "component-model-async",
+    "component-model-bytes",
+] }
 wasmtime-wasi = { workspace = true, features = ["p2"] }
 wit-parser = { workspace = true }
 wrpc-introspect = { workspace = true }

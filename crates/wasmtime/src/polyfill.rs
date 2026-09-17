@@ -145,7 +145,8 @@ async fn invoke<T: WrpcView>(
     let mut buf = BytesMut::default();
     let mut deferred = vec![];
     for (v, (name, ref ty)) in zip(params, params_ty) {
-        let mut enc = ValEncoder::new(store.as_context_mut(), ty, &guest_resources, &[]);
+        let mut access = crate::Direct(store.as_context_mut());
+        let mut enc = ValEncoder::new(&mut access, None, ty, &guest_resources, &[]);
         enc.encode(v, &mut buf)
             .with_context(|| format!("failed to encode parameter `{name}`"))?;
         deferred.push(enc.deferred);
@@ -199,7 +200,8 @@ async fn invoke<T: WrpcView>(
         let mut incoming = pin!(incoming);
         for (i, (v, ref ty)) in zip(results, results_ty).enumerate() {
             read_value(
-                &mut store,
+                &mut crate::Direct(&mut store),
+                None,
                 &mut incoming,
                 &guest_resources,
                 &[],
