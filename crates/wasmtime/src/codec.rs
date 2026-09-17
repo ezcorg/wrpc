@@ -894,7 +894,6 @@ where
                     .wrpc()
                     .ctx
                     .shared_resources()
-                    .0
                     .get(&id)
                     .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
                 *val = Val::Resource(*resource);

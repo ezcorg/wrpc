@@ -5,7 +5,7 @@ use core::borrow::Borrow;
 use core::fmt;
 use core::future::Future;
 use core::iter::zip;
-use core::pin::pin;
+use core::pin::{Pin, pin};
 use core::time::Duration;
 
 use std::collections::{BTreeMap, HashMap};
@@ -44,7 +44,7 @@ pub use serve::*;
 // this returns the RPC name for a wasmtime function name.
 // Unfortunately, the [`types::ComponentFunc`] does not include the kind information and we want to
 // avoid (re-)parsing the WIT here.
-fn rpc_func_name(name: &str) -> &str {
+pub fn rpc_func_name(name: &str) -> &str {
     if let Some(name) = name.strip_prefix("[constructor]") {
         name
     } else if let Some(name) = name.strip_prefix("[static]") {
@@ -86,45 +86,86 @@ pub struct RemoteResource(pub Bytes);
 /// resources (0 = unbounded). It's a backstop against unbounded growth when a client
 /// keeps acquiring handles without dropping them — exhaustion then surfaces to the
 /// caller as an error rather than growing memory without limit.
+///
+/// Every handle is **bound to the scope it was minted in**: the transport
+/// connection, identified by whatever the server sets with [`Self::set_scope`]
+/// before serving an invocation. A lookup or removal from any other scope finds
+/// nothing, so a handle that leaks out of one connection is inert on every
+/// other. A server that never sets a scope mints unscoped handles, visible only
+/// to unscoped invocations.
 #[derive(Debug, Default)]
-pub struct SharedResourceTable(HashMap<Uuid, ResourceAny>, usize);
+pub struct SharedResourceTable {
+    entries: HashMap<Uuid, (ResourceAny, Option<u64>)>,
+    capacity: usize,
+    scope: Option<u64>,
+}
 
 impl SharedResourceTable {
     /// A table that refuses more than `capacity` live resources (0 = unbounded).
     pub fn with_capacity(capacity: usize) -> Self {
-        Self(HashMap::new(), capacity)
+        Self {
+            entries: HashMap::new(),
+            capacity,
+            scope: None,
+        }
+    }
+
+    /// The scope (connection) the next inserts are tagged with and the next
+    /// lookups are restricted to. Set it before each invocation from that
+    /// invocation's transport context.
+    pub fn set_scope(&mut self, scope: Option<u64>) {
+        self.scope = scope;
+    }
+
+    /// The current scope.
+    pub fn scope(&self) -> Option<u64> {
+        self.scope
     }
 
     /// Insert an exported resource, returning `Err` once at capacity so the invocation
-    /// fails cleanly instead of the host growing memory without bound.
+    /// fails cleanly instead of the host growing memory without bound. The entry is
+    /// tagged with the current scope.
     pub fn try_insert(&mut self, id: Uuid, resource: ResourceAny) -> std::io::Result<()> {
-        if self.1 != 0 && self.0.len() >= self.1 && !self.0.contains_key(&id) {
+        if self.capacity != 0
+            && self.entries.len() >= self.capacity
+            && !self.entries.contains_key(&id)
+        {
             return Err(std::io::Error::other(format!(
                 "shared resource table at capacity ({} live handles)",
-                self.1
+                self.capacity
             )));
         }
-        self.0.insert(id, resource);
+        self.entries.insert(id, (resource, self.scope));
         Ok(())
     }
 
-    /// Remove and return the exported resource for `id`, if present. The caller is
-    /// responsible for dropping the returned [`ResourceAny`] via
+    /// The exported resource for `id`, if it is live **and** was minted in the
+    /// current scope.
+    pub fn get(&self, id: &Uuid) -> Option<&ResourceAny> {
+        match self.entries.get(id) {
+            Some((resource, scope)) if *scope == self.scope => Some(resource),
+            _ => None,
+        }
+    }
+
+    /// Remove and return the exported resource for `id`, if present in the current
+    /// scope. The caller is responsible for dropping the returned [`ResourceAny`] via
     /// `ResourceAny::resource_drop[_async]` (which runs the guest destructor) — this
     /// only evicts the table entry. Enables a client to relay a resource-drop so a
     /// handle it is done with is released instead of leaking for the connection's life.
     pub fn remove(&mut self, id: &Uuid) -> Option<ResourceAny> {
-        self.0.remove(id)
+        self.get(id)?;
+        self.entries.remove(id).map(|(resource, _)| resource)
     }
 
-    /// The number of live exported-resource handles in the table.
+    /// The number of live exported-resource handles in the table, across every scope.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.entries.len()
     }
 
     /// Whether the table holds no live handles.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.entries.is_empty()
     }
 }
 
@@ -401,9 +442,9 @@ impl fmt::Display for CallError {
 
 #[allow(clippy::too_many_arguments)]
 pub async fn call<C>(
-    mut store: C,
+    store: C,
     rx: Incoming,
-    mut tx: Outgoing,
+    tx: Outgoing,
     guest_resources: &[ResourceType],
     host_resources: &HashMap<Box<str>, HashMap<Box<str>, (ResourceType, ResourceType)>>,
     io_streams: &[ResourceType],
@@ -414,6 +455,54 @@ pub async fn call<C>(
 where
     C: AsContextMut,
     C::Data: WrpcView,
+{
+    call_with(
+        store,
+        rx,
+        tx,
+        guest_resources,
+        host_resources,
+        io_streams,
+        params_ty,
+        results_ty,
+        move |_, _| Box::pin(core::future::ready(Ok(Chosen { func }))),
+    )
+    .await
+}
+
+/// The function a [`call_with`] chooser settled on, once the parameters are
+/// decoded.
+pub struct Chosen {
+    pub func: Func,
+}
+
+/// A [`call`] whose function is chosen **after** the parameters are decoded, by
+/// `choose`, which sees the decoded values and the store. This is how one served
+/// export name can front several instances in the same store: a method call is
+/// routed to the instance that owns its resource, a freestanding call to whichever
+/// instance its arguments select. `guest_resources` are the resource types a
+/// parameter or result may be declared as, across every instance the name fronts;
+/// the codec checks declared types against it (the instance's *live* types are
+/// what a decoded `ResourceAny` reports, and are the chooser's to route on).
+#[allow(clippy::too_many_arguments)]
+pub async fn call_with<C, F>(
+    mut store: C,
+    rx: Incoming,
+    mut tx: Outgoing,
+    guest_resources: &[ResourceType],
+    host_resources: &HashMap<Box<str>, HashMap<Box<str>, (ResourceType, ResourceType)>>,
+    io_streams: &[ResourceType],
+    params_ty: impl ExactSizeIterator<Item = &Type>,
+    results_ty: &[Type],
+    choose: F,
+) -> Result<(), CallError>
+where
+    C: AsContextMut,
+    C::Data: WrpcView,
+    F: for<'a> FnOnce(
+        &'a mut C,
+        &'a [Val],
+    ) -> Pin<Box<dyn Future<Output = wasmtime::Result<Chosen>> + Send + 'a>>,
 {
     let mut params = vec![Val::Bool(false); params_ty.len()];
     let mut rx = pin!(rx);
@@ -431,6 +520,9 @@ where
         .with_context(|| format!("failed to decode parameter value {i}"))
         .map_err(CallError::Decode)?;
     }
+    let Chosen { func } = choose(&mut store, &params)
+        .await
+        .map_err(|e| CallError::Call(e.context("failed to choose the function to call")))?;
     let mut results = vec![Val::Bool(false); results_ty.len()];
     func.call_async(&mut store, &params, &mut results)
         .await

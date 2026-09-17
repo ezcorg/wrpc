@@ -152,7 +152,7 @@ fn async_paths(ty: &Type, streams: &[ResourceType]) -> (BTreeSet<VecDeque<Option
 /// Each parameter is treated as an element of a top-level tuple: a parameter at
 /// index `i` whose type carries asynchronous data contributes paths prefixed
 /// with `Some(i)`.
-pub(crate) fn params_async_paths<'a>(
+pub fn params_async_paths<'a>(
     params: impl IntoIterator<Item = &'a Type>,
     streams: &[ResourceType],
 ) -> Arc<[Box<[Option<usize>]>]> {
